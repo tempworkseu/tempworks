@@ -17,19 +17,35 @@
 # ─────────────────────────────────────────────────────────────────────────────
 ARG NODE_IMAGE=node:22-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d
 ARG PG_MAJOR=18
+# Prisma schema-engine build the runtime needs (Debian bookworm ships libssl3).
+ARG PRISMA_BINARY_TARGET=debian-openssl-3.0.x
+
+# ── 0. OS layer shared by every stage ────────────────────────────────────────
+# Prisma's postinstall picks the schema-engine binary from the OpenSSL it
+# detects. The slim base has none, so without this layer it falls back to
+# debian-openssl-1.1.x, while the runtime (libssl3 via the PostgreSQL client)
+# needs debian-openssl-3.0.x: the CLI then tries to download it into the
+# read-only node_modules at start and `prisma migrate deploy` fails.
+FROM ${NODE_IMAGE} AS os
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends openssl ca-certificates; \
+    rm -rf /var/lib/apt/lists/*
 
 # ── 1. production dependencies (+ generated Prisma client) ───────────────────
-FROM ${NODE_IMAGE} AS prod-deps
+FROM os AS prod-deps
+ARG PRISMA_BINARY_TARGET
 WORKDIR /app
 COPY package.json package-lock.json ./
 # devOptional packages (prisma CLI, its config loader) are kept by --omit=dev.
-RUN npm ci --omit=dev --no-audit --no-fund
+RUN npm ci --omit=dev --no-audit --no-fund \
+ && test -x "node_modules/@prisma/engines/schema-engine-${PRISMA_BINARY_TARGET}"
 COPY prisma ./prisma
 COPY prisma.config.ts ./
 RUN DATABASE_URL=postgresql://build:build@127.0.0.1:5432/build npx --no-install prisma generate
 
 # ── 2. compile (needs devDependencies: nest CLI, typescript) ─────────────────
-FROM ${NODE_IMAGE} AS build
+FROM os AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --include=dev --no-audit --no-fund
@@ -38,12 +54,13 @@ RUN DATABASE_URL=postgresql://build:build@127.0.0.1:5432/build npm run build \
  && test -f dist/src/main.js
 
 # ── 3. runtime ───────────────────────────────────────────────────────────────
-FROM ${NODE_IMAGE} AS runtime
+FROM os AS runtime
 ARG PG_MAJOR
+ARG PRISMA_BINARY_TARGET
 # PostgreSQL client from the PGDG repository (Debian's own is v15).
 RUN set -eux; \
     apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates curl tini python3; \
+    apt-get install -y --no-install-recommends curl tini python3; \
     install -d /usr/share/postgresql-common/pgdg; \
     curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc; \
     echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" > /etc/apt/sources.list.d/pgdg.list; \
@@ -69,6 +86,10 @@ RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh \
  && mkdir -p uploads backups && chown -R node:node uploads backups
 
 USER node
+# Fail the build unless the Prisma CLI runs as the runtime user with the engine
+# already in the image (node_modules stays root-owned and read-only).
+RUN DATABASE_URL=postgresql://build:build@127.0.0.1:5432/build npx --no-install prisma --version \
+      | grep -F "schema-engine-${PRISMA_BINARY_TARGET})"
 # App Platform routes to http_port (default 8080) and injects PORT; the app
 # listens on $PORT.
 EXPOSE 8080
